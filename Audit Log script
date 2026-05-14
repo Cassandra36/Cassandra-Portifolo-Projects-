@@ -1,0 +1,188 @@
+%pyspark
+import re
+from datetime import datetime
+import pytz
+from pyspark.sql import functions as F
+
+# 1. CSS for Layout - Tightened for 5/14/2026 updates
+print("%html")
+print("""
+<style>
+    .p-form-container, .form-inline {
+        display: flex !important;
+        flex-direction: row !important;
+        flex-wrap: nowrap !important;
+        align-items: flex-end !important;
+    }
+    .form-group { 
+        display: inline-block !important; 
+        margin-right: 12px !important; 
+        width: auto !important;
+    }
+    .form-control { width: 160px !important; } /* Slightly narrower for more screen fit */
+    input[name="Date"], input[name="Serial"] { width: 100px !important; }
+</style>
+""")
+
+# 2. Basic Inputs
+platform = z.select("Platform", [("nano", "Nano"), ("gpd", "GPD")], "nano")
+date_input = z.input("Date", "20260513")
+site = z.input("Serial", "29644")
+environment = "useast1-nlsn-mdl-e-tam-cnc-collection-event-prod"
+
+# Paths for Recursive and Fallback searches
+path_prefix = f"s3a://{environment}/{platform}/{date_input}/{site}/"
+fallback_path = f"s3a://{environment}/{platform}/{date_input}/"
+
+# 3. Fault/Flag Logic Mapping
+options_list = [
+    ("UP2", "UP2 - Attachment Unplugged"), ("CWO", "CWO - Code While Off"), 
+    ("S4_DM1_NC", "S4/DM1/NC - WiFi & Comm"), ("EE1", "EE1 - Excessive Events"), 
+    ("AO2_SDF_AD", "AO2/SDF - Source Detection"), ("Meter_Resets", "Meter Resets"), 
+    ("UA_GPM", "UA - Unidentified Audience"), ("N6_N2_CBET", "N2_N6_CBET"), ("SNR_Stats", "SNR Stats")
+]
+options_list.sort(key=lambda x: x[1])
+selected_fault = z.select("Fault/Flag Type", options_list, "UP2")
+
+filter_map = {
+    "UP2": {"CurrentCondition", "UnitPower", "USBTV", "ButtonMic", "plugged=", "LineAudio", "isCalibrated", "BatteryState"},
+    "CWO": {"TVStateEvent", "blueCTSA value", "calibration", "UnifiedWatermark", "Attachement", "plugged="},
+    "S4_DM1_NC": {"WiFiDiagnostics", "WiFi channel", "Meter Call", "WiFiAPClient", "CellConnectionStatus", "GPDDeviceCall"},
+    "EE1": {"TVStateEvent", "blueCTSA value", "calibration"},
+    "AO2_SDF_AD": {"SNREvent", "TVStateEvent", "SourceDetectionStateEvent"},
+    "Meter_Resets": {"Meter Call", "MeterResetEvent", "WiFi channel"},
+    "UA_GPM": {"TVStateEvent", "GPMEvent", "UnifiedWatermark"},
+    "N6_N2_CBET": {"TVStateEvent", "UnifiedWatermark", "cbetID"},
+    "SNR_Stats": {"SNREvent", "ARMS", "UnifiedWatermark"},
+    "GPD_Basic": {"GPDDeviceCall", "CellConnectionStatus", "WiFiAPClient", "status="}
+}
+
+# 4. Checkbox Logic
+print("%html <div style='color:red; font-size:12px; font-weight:bold; margin-top:10px;'>WARNING: UNCHECK ALL CHECKBOXES TO USE DROPDOWN</div>")
+
+nano_checkboxes = z.checkbox("Nano Events", [
+    ("BatteryState", "BatteryState"), ("CTSAPowerStats", "CTSAPowerStats"), ("GPMEvent", "GPMEvents"), 
+    ("MeterResetEvent","MeterResetEvent"), ("VerboseEvent", "VerboseEvents")
+], [])
+
+gpd_checkboxes = z.checkbox("GPD Events", [
+    ("GcmAntennasEvent", "Antenna"), ("CellConnectionStatus", "Cell Status"), 
+    ("GPDDeviceCall", "Device Call"), ("FW Version", "FW Version"), 
+    ("status=", "Status Updates"), ("WiFiAPClient", "WiFi Client")
+], [])
+
+selected_checkboxes = list(nano_checkboxes) + list(gpd_checkboxes)
+if selected_checkboxes:
+    active_keywords = set(selected_checkboxes)
+    audit_label = f"Manual Filter: {', '.join(selected_checkboxes)}"
+else:
+    active_keywords = filter_map.get(selected_fault, set())
+    audit_label = f"Fault/Flag: {selected_fault}"
+
+b_keywords = sc.broadcast([k.lower() for k in active_keywords])
+
+# Platform Mismatch Alert Logic
+nano_only_keys = {"GPMEvent", "VerboseEvent", "CTSAPowerStats", "MeterResetEvent", "BatteryState"}
+gpd_only_keys = {"GcmAntennasEvent", "GPDDeviceCall", "CellConnectionStatus", "WiFiAPClient", "status="}
+
+mismatch = False
+if platform == "nano" and any(k in gpd_only_keys for k in selected_checkboxes): mismatch = True
+elif platform == "gpd" and any(k in nano_only_keys for k in selected_checkboxes): mismatch = True
+
+if mismatch:
+    print(f"%html <div style='padding:10px; margin-bottom:10px; background-color:#fff3cd; border:1px solid #ffeeba; color:#856404; border-radius:4px;'>")
+    print(f"<b>Note:</b> You have selected {platform.upper()} as your platform, but chose filters for the other platform. This may result in 0 logs found.</div>")
+
+# 5. Processing Pipeline
+time_regex = re.compile(r'timestamp="([^"]+)"')
+target_zone = pytz.timezone("America/New_York")
+
+def process_line(item):
+    line, idx = item
+    line = line.replace("\\", "").strip()
+    match = time_regex.search(line)
+    if match:
+        try:
+            ts_str = match.group(1).replace("Z", "+00:00")
+            eastern_time = datetime.fromisoformat(ts_str).astimezone(target_zone).strftime("%Y-%m-%d %H:%M:%S %Z")
+        except: eastern_time = "Invalid Date"
+    else: eastern_time = "No Timestamp"
+    return (eastern_time, line, idx)
+
+hadoop_conf = sc._jsc.hadoopConfiguration()
+hadoop_conf.set("mapreduce.input.fileinputformat.input.dir.recursive", "true")
+
+result = []
+found_path = False
+
+try:
+    raw_log_rdd = (sc.textFile(path_prefix).flatMap(lambda x: re.split(r'(?<=>)(?=<)', x)).zipWithIndex().cache())
+    if not raw_log_rdd.isEmpty(): found_path = True
+except: pass
+
+if not found_path:
+    try:
+        raw_log_rdd = (sc.textFile(f"{fallback_path}*{site}*").flatMap(lambda x: re.split(r'(?<=>)(?=<)', x)).zipWithIndex().cache())
+        if not raw_log_rdd.isEmpty(): found_path = True
+    except: pass
+
+# Process Result
+if found_path:
+    result = (raw_log_rdd.filter(lambda x: any(k in x[0].lower() for k in b_keywords.value)).map(process_line).collect())
+else:
+    print(f"%html <div style='padding:20px; background-color:#f8d7da; color:#721c24; border:1px solid #f5c6cb; border-radius:8px; font-family:sans-serif;'>")
+    print(f"<b>SERIAL NOT FOUND:</b> Site ID <b>{site}</b> does not exist for <b>{platform.upper()}</b> on <b>{date_input}</b>.</div>")
+
+# 6. Output Render
+if result:
+    result.sort(key=lambda x: x[2])
+    header_title = f"{platform.upper()} AUDIT LOG REPORT"
+    html_output = f"""
+    <style>
+        .report-header {{ background-color: #009DD9; color: white; padding: 20px; font-family: 'Courier New', monospace; border-radius: 8px 8px 0 0; }}
+        .log-container {{ max-height: 600px; overflow-y: auto; border: 2px solid #333; font-family: 'Courier New', monospace; }}
+        .log-table {{ width: 100%; border-collapse: collapse; font-size: 13px; }}
+        .log-table th {{ position: sticky; top: 0; background: #333; color: white; padding: 12px 10px; z-index: 10; text-align: left; }}
+        .log-table td {{ padding: 6px 10px; border-bottom: 1px solid #ddd; white-space: pre-wrap; word-break: break-all; color: #000; }}
+        .log-table tr:hover {{ background-color: #f0faff; border-left: 5px solid #009DD9; }}
+        .timestamp {{ color: #444; font-weight: bold; width: 200px; }}
+        .false-highlight {{ color: #d9534f !important; font-weight: bold !important; display: inline !important; }}
+    </style>
+    <div class="report-header">
+        <div style="font-size: 20px; text-align: center; letter-spacing: 2px; font-weight:bold;">{header_title}</div>
+        <hr style="border: 0; border-top: 1px solid #555; margin: 10px 0;">
+        <table style="color: white; font-size: 14px;">
+            <tr><td><b>PLATFORM</b></td><td>: {platform.upper()}</td></tr>
+            <tr><td><b>SITE ID</b></td><td>: {site}</td></tr>
+            <tr><td><b>DATE</b></td><td>: {date_input}</td></tr>
+            <tr><td><b>FILTER</b></td><td>: {audit_label}</td></tr>
+        </table>
+    </div>
+    <div class="log-container">
+        <table class="log-table">
+            <thead>
+                <tr><th>TIME EASTERN</th><th>LOG EVENT DATA</th></tr>
+            </thead>
+            <tbody>
+    """
+    last_v_ts = "0000-00-00 00:00:00"
+    false_regex = re.compile(r'(false)', re.IGNORECASE)
+
+    for ts, line, idx in result:
+        display_ts = ts if ts not in ["No Timestamp", "Invalid Date"] else last_v_ts
+        if ts not in ["No Timestamp", "Invalid Date"]: last_v_ts = ts
+        
+        # Apply the "false" highlight
+        tagged_line = false_regex.sub(r'__START_FL__\1__END_FL__', line)
+        escaped_line = tagged_line.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+        escaped_line = escaped_line.replace('__START_FL__', '<span class="false-highlight">').replace('__END_FL__', '</span>')
+        
+        html_output += f"<tr><td class='timestamp'>{display_ts}</td><td>{escaped_line}</td></tr>"
+        
+    html_output += f"</tbody></table></div><p style='font-size:11px; color:#666; font-weight:bold; margin-top:5px;'>Created by Cassandra | Platform: {platform}</p>"
+    print("%html " + html_output)
+elif found_path:
+    print(f"%html <div style='padding:20px; color:orange; font-family:monospace;'>No logs matching <b>{audit_label}</b> were found in the file.</div>")
+#5/13/2026 Changes made to this-added GPD events, took away Environment option, added Platform box to switch between platforms, shorted the input boxes so more fits on one line. Also added alerts for when a wrong checkbox is checked for the current platform. Removed drop down for CTSAPowerStats-they seem to work just fine with checkbox
+
+#5/14/2026 added red to false to see if it will work
